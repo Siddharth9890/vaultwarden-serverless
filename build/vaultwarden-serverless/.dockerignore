@@ -1,0 +1,40 @@
+# Local build artifacts
+target
+
+# Data folder
+data
+
+# Misc
+.env
+.env.template
+.gitattributes
+.gitignore
+rustfmt.toml
+
+# IDE files
+.vscode
+.idea
+.editorconfig
+*.iml
+
+# Documentation
+.github
+*.md
+*.txt
+*.yml
+*.yaml
+
+# Docker
+hooks
+tools
+Dockerfile
+.dockerignore
+docker/**
+!docker/healthcheck.sh
+!docker/start.sh
+
+# Web vault
+web-vault
+
+# Vaultwarden Resources
+resources

@@ -1,0 +1,18 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Globals:
+  Function:
+    Runtime: provided
+    Timeout: 10
+
+Resources:
+  MyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: hello.handler
+      CodeUri: .
+      Role: LambdaExecutionRole
+      Environment:
+        Variables:
+          MY_ENV_VAR: my_value
