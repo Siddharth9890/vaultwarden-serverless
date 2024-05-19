@@ -1,4 +1,4 @@
-use chrono::{Duration, Utc};
+use chrono::{TimeDelta, Utc};
 use data_encoding::BASE32;
 use rocket::serde::json::Json;
 use rocket::Route;
@@ -46,17 +46,9 @@ pub fn routes() -> Vec<Route> {
 
 #[get("/two-factor")]
 async fn get_twofactor(headers: Headers, mut conn: DbConn) -> Json<Value> {
-    println!(
-        "here in before two factors"
-    );
     let twofactors = TwoFactor::find_by_user(&headers.user.uuid, &mut conn).await;
-     println!(
-        "here in two factors"
-    );
     let twofactors_json: Vec<Value> = twofactors.iter().map(TwoFactor::to_json_provider).collect();
-    println!(
-        "here in after two factors"
-    );
+
     Json(json!({
         "Data": twofactors_json,
         "Object": "list",
@@ -267,7 +259,7 @@ pub async fn send_incomplete_2fa_notifications(pool: DbPool) {
     };
 
     let now = Utc::now().naive_utc();
-    let time_limit = Duration::minutes(CONFIG.incomplete_2fa_time_limit());
+    let time_limit = TimeDelta::try_minutes(CONFIG.incomplete_2fa_time_limit()).unwrap();
     let time_before = now - time_limit;
     let incomplete_logins = TwoFactorIncomplete::find_logins_before(&time_before, &mut conn).await;
     for login in incomplete_logins {

@@ -320,9 +320,29 @@ async fn get_org_collections_details(org_id: &str, headers: ManagerHeadersLoose,
         None => err!("User is not part of organization"),
     };
 
+    // get all collection memberships for the current organization
     let coll_users = CollectionUser::find_by_organization(org_id, &mut conn).await;
 
+    // check if current user has full access to the organization (either directly or via any group)
+    let has_full_access_to_org = user_org.access_all
+        || (CONFIG.org_groups_enabled()
+            && GroupUser::has_full_access_by_member(org_id, &user_org.uuid, &mut conn).await);
+
     for col in Collection::find_by_organization(org_id, &mut conn).await {
+        // check whether the current user has access to the given collection
+        let assigned = has_full_access_to_org
+            || CollectionUser::has_access_to_collection_by_user(&col.uuid, &user_org.user_uuid, &mut conn).await
+            || (CONFIG.org_groups_enabled()
+                && GroupUser::has_access_to_collection_by_member(&col.uuid, &user_org.uuid, &mut conn).await);
+
+        // get the users assigned directly to the given collection
+        let users: Vec<Value> = coll_users
+            .iter()
+            .filter(|collection_user| collection_user.collection_uuid == col.uuid)
+            .map(|collection_user| SelectionReadOnly::to_collection_user_details_read_only(collection_user).to_json())
+            .collect();
+
+        // get the group details for the given collection
         let groups: Vec<Value> = if CONFIG.org_groups_enabled() {
             CollectionGroup::find_by_collection(&col.uuid, &mut conn)
                 .await
@@ -332,28 +352,8 @@ async fn get_org_collections_details(org_id: &str, headers: ManagerHeadersLoose,
                 })
                 .collect()
         } else {
-            // The Bitwarden clients seem to call this API regardless of whether groups are enabled,
-            // so just act as if there are no groups.
             Vec::with_capacity(0)
         };
-
-        let mut assigned = false;
-        let users: Vec<Value> = coll_users
-            .iter()
-            .filter(|collection_user| collection_user.collection_uuid == col.uuid)
-            .map(|collection_user| {
-                // Remember `user_uuid` is swapped here with the `user_org.uuid` with a join during the `CollectionUser::find_by_organization` call.
-                // We check here if the current user is assigned to this collection or not.
-                if collection_user.user_uuid == user_org.uuid {
-                    assigned = true;
-                }
-                SelectionReadOnly::to_collection_user_details_read_only(collection_user).to_json()
-            })
-            .collect();
-
-        if user_org.access_all {
-            assigned = true;
-        }
 
         let mut json_object = col.to_json();
         json_object["Assigned"] = json!(assigned);
@@ -664,24 +664,16 @@ async fn get_org_collection_detail(
                 Vec::with_capacity(0)
             };
 
-            let mut assigned = false;
             let users: Vec<Value> =
                 CollectionUser::find_by_collection_swap_user_uuid_with_org_user_uuid(&collection.uuid, &mut conn)
                     .await
                     .iter()
                     .map(|collection_user| {
-                        // Remember `user_uuid` is swapped here with the `user_org.uuid` with a join during the `find_by_collection_swap_user_uuid_with_org_user_uuid` call.
-                        // We check here if the current user is assigned to this collection or not.
-                        if collection_user.user_uuid == user_org.uuid {
-                            assigned = true;
-                        }
                         SelectionReadOnly::to_collection_user_details_read_only(collection_user).to_json()
                     })
                     .collect();
 
-            if user_org.access_all {
-                assigned = true;
-            }
+            let assigned = Collection::can_access_collection(&user_org, &collection.uuid, &mut conn).await;
 
             let mut json_object = collection.to_json();
             json_object["Assigned"] = json!(assigned);
@@ -1071,7 +1063,7 @@ async fn accept_invite(
     let claims = decode_invite(&data.Token)?;
 
     match User::find_by_mail(&claims.email, &mut conn).await {
-        Some(_) => {
+        Some(user) => {
             Invitation::take(&claims.email, &mut conn).await;
 
             if let (Some(user_org), Some(org)) = (&claims.user_org_id, &claims.org_id) {
@@ -1095,7 +1087,11 @@ async fn accept_invite(
                     match OrgPolicy::is_user_allowed(&user_org.user_uuid, org_id, false, &mut conn).await {
                         Ok(_) => {}
                         Err(OrgPolicyErr::TwoFactorMissing) => {
-                            err!("You cannot join this organization until you enable two-step login on your user account");
+                            if CONFIG.email_2fa_auto_fallback() {
+                                two_factor::email::activate_email_2fa(&user, &mut conn).await?;
+                            } else {
+                                err!("You cannot join this organization until you enable two-step login on your user account");
+                            }
                         }
                         Err(OrgPolicyErr::SingleOrgEnforced) => {
                             err!("You cannot join this organization because you are a member of an organization which forbids it");
@@ -1220,10 +1216,14 @@ async fn _confirm_invite(
         match OrgPolicy::is_user_allowed(&user_to_confirm.user_uuid, org_id, true, conn).await {
             Ok(_) => {}
             Err(OrgPolicyErr::TwoFactorMissing) => {
-                err!("You cannot confirm this user because it has no two-step login method activated");
+                if CONFIG.email_2fa_auto_fallback() {
+                    two_factor::email::find_and_activate_email_2fa(&user_to_confirm.user_uuid, conn).await?;
+                } else {
+                    err!("You cannot confirm this user because they have not setup 2FA");
+                }
             }
             Err(OrgPolicyErr::SingleOrgEnforced) => {
-                err!("You cannot confirm this user because it is a member of an organization which forbids it");
+                err!("You cannot confirm this user because they are a member of an organization which forbids it");
             }
         }
     }
@@ -1351,10 +1351,14 @@ async fn edit_user(
         match OrgPolicy::is_user_allowed(&user_to_edit.user_uuid, org_id, true, &mut conn).await {
             Ok(_) => {}
             Err(OrgPolicyErr::TwoFactorMissing) => {
-                err!("You cannot modify this user to this type because it has no two-step login method activated");
+                if CONFIG.email_2fa_auto_fallback() {
+                    two_factor::email::find_and_activate_email_2fa(&user_to_edit.user_uuid, &mut conn).await?;
+                } else {
+                    err!("You cannot modify this user to this type because they have not setup 2FA");
+                }
             }
             Err(OrgPolicyErr::SingleOrgEnforced) => {
-                err!("You cannot modify this user to this type because it is a member of an organization which forbids it");
+                err!("You cannot modify this user to this type because they are a member of an organization which forbids it");
             }
         }
     }
@@ -1598,7 +1602,7 @@ async fn post_org_import(
     let mut ciphers = Vec::new();
     for cipher_data in data.Ciphers {
         let mut cipher = Cipher::new(cipher_data.Type, cipher_data.Name.clone());
-        update_cipher_from_data(&mut cipher, cipher_data, &headers, false, &mut conn, &nt, UpdateType::None).await.ok();
+        update_cipher_from_data(&mut cipher, cipher_data, &headers, None, &mut conn, &nt, UpdateType::None).await.ok();
         ciphers.push(cipher);
     }
 
@@ -2151,10 +2155,14 @@ async fn _restore_organization_user(
                 match OrgPolicy::is_user_allowed(&user_org.user_uuid, org_id, false, conn).await {
                     Ok(_) => {}
                     Err(OrgPolicyErr::TwoFactorMissing) => {
-                        err!("You cannot restore this user because it has no two-step login method activated");
+                        if CONFIG.email_2fa_auto_fallback() {
+                            two_factor::email::find_and_activate_email_2fa(&user_org.user_uuid, conn).await?;
+                        } else {
+                            err!("You cannot restore this user because they have not setup 2FA");
+                        }
                     }
                     Err(OrgPolicyErr::SingleOrgEnforced) => {
-                        err!("You cannot restore this user because it is a member of an organization which forbids it");
+                        err!("You cannot restore this user because they are a member of an organization which forbids it");
                     }
                 }
             }
@@ -2223,7 +2231,7 @@ impl GroupRequest {
     }
 
     pub fn update_group(&self, mut group: Group) -> Group {
-        group.name = self.Name.clone();
+        group.name.clone_from(&self.Name);
         group.access_all = self.AccessAll.unwrap_or(false);
         // Group Updates do not support changing the external_id
         // These input fields are in a disabled state, and can only be updated/added via ldap_import

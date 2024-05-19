@@ -40,3 +40,5 @@ terraform.rc
 **/build/terraform/*
 # Ignore .idea
 **/.idea/*
+
+.DS_Store
