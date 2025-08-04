@@ -47,6 +47,7 @@ CMD \
   strip --strip-all bootstrap && \
   size bootstrap && \
   ldd  bootstrap && \
+  find /usr -name "libpq.so*" 2>/dev/null && \
   # Copy shared libraries (postgres, mysql)
   mkdir -p lib && \
   cp /usr/lib64/mysql/libmysqlclient.so lib/libmysqlclient.so.18 && \

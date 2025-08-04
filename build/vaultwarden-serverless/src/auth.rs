@@ -31,9 +31,66 @@ static PRIVATE_RSA_KEY: OnceCell<EncodingKey> = OnceCell::new();
 static PUBLIC_RSA_KEY: OnceCell<DecodingKey> = OnceCell::new();
 
 pub fn initialize_keys() -> Result<(), crate::error::Error> {
-    let mut priv_key_buffer = Vec::with_capacity(2048);
+    info!("🔐 Starting JWT key initialization for serverless environment...");
 
-    let priv_key = {
+    let priv_key_buffer = get_or_generate_rsa_key()?;
+
+    let priv_key = Rsa::private_key_from_pem(&priv_key_buffer)?;
+    let pub_key_buffer = priv_key.public_key_to_pem()?;
+
+    let key_fingerprint = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        priv_key_buffer.hash(&mut hasher);
+        format!("{:x}", hasher.finish())
+    };
+
+    info!("RSA Key fingerprint: {}", key_fingerprint);
+
+    let enc = EncodingKey::from_rsa_pem(&priv_key_buffer)?;
+    let dec: DecodingKey = DecodingKey::from_rsa_pem(&pub_key_buffer)?;
+
+    if PRIVATE_RSA_KEY.set(enc).is_err() {
+        err!("PRIVATE_RSA_KEY must only be initialized once")
+    }
+    if PUBLIC_RSA_KEY.set(dec).is_err() {
+        err!("PUBLIC_RSA_KEY must only be initialized once")
+    }
+
+    info!("JWT keys initialized successfully with fingerprint: {}", key_fingerprint);
+    Ok(())
+}
+
+fn get_or_generate_rsa_key() -> Result<Vec<u8>, crate::error::Error> {
+    use std::{
+        fs::File,
+        io::{Read, Write},
+    };
+
+    if let Ok(env_key) = std::env::var("VAULTWARDEN_RSA_KEY") {
+        info!("Using RSA key from VAULTWARDEN_RSA_KEY environment variable");
+
+        let processed_key = env_key.replace("\\n", "\n");
+        let key_bytes = processed_key.into_bytes();
+
+        match openssl::rsa::Rsa::private_key_from_pem(&key_bytes) {
+            Ok(_) => {
+                info!("✅ RSA key from environment validated successfully");
+                return Ok(key_bytes);
+            }
+            Err(e) => {
+                error!("❌ Failed to parse RSA key from environment: {}", e);
+                error!("This will cause random logouts in serverless environments!");
+            }
+        }
+    }
+
+    info!("Environment variable not found, falling back to file-based key");
+
+    let mut priv_key_buffer = Vec::with_capacity(2048);
+    let _priv_key = {
         let mut priv_key_file =
             File::options().create(true).truncate(false).read(true).write(true).open(CONFIG.private_rsa_key())?;
 
@@ -41,28 +98,29 @@ pub fn initialize_keys() -> Result<(), crate::error::Error> {
         let bytes_read = priv_key_file.read_to_end(&mut priv_key_buffer)?;
 
         if bytes_read > 0 {
+            info!("Using existing RSA key from file: {}", CONFIG.private_rsa_key());
             Rsa::private_key_from_pem(&priv_key_buffer[..bytes_read])?
         } else {
-            // Only create the key if the file doesn't exist or is empty
+            warn!("No persistent RSA key found. Generating new key - this will invalidate existing JWT tokens!");
+            warn!(
+                "For serverless deployments, set VAULTWARDEN_RSA_KEY environment variable to prevent random logouts."
+            );
+
             let rsa_key = openssl::rsa::Rsa::generate(2048)?;
             priv_key_buffer = rsa_key.private_key_to_pem()?;
-            priv_key_file.write_all(&priv_key_buffer)?;
-            info!("Private key created correctly.");
+
+            match priv_key_file.write_all(&priv_key_buffer) {
+                Ok(_) => info!("Private key created and saved to file."),
+                Err(_) => {
+                    warn!("Could not save private key to file (read-only filesystem). Key exists only in memory.")
+                }
+            }
+
             rsa_key
         }
     };
 
-    let pub_key_buffer = priv_key.public_key_to_pem()?;
-
-    let enc = EncodingKey::from_rsa_pem(&priv_key_buffer)?;
-    let dec: DecodingKey = DecodingKey::from_rsa_pem(&pub_key_buffer)?;
-    if PRIVATE_RSA_KEY.set(enc).is_err() {
-        err!("PRIVATE_RSA_KEY must only be initialized once")
-    }
-    if PUBLIC_RSA_KEY.set(dec).is_err() {
-        err!("PUBLIC_RSA_KEY must only be initialized once")
-    }
-    Ok(())
+    Ok(priv_key_buffer)
 }
 
 pub fn encode_jwt<T: Serialize>(claims: &T) -> String {
@@ -461,6 +519,9 @@ impl<'r> FromRequest<'r> for Headers {
             None => err_handler!("No access token provided"),
         };
 
+        debug!("Received Authorization header");
+        debug!("Access token (first 20 chars): {}...", &access_token);
+
         // Check JWT token is valid and get device and user from it
         let claims = match decode_login(access_token) {
             Ok(claims) => claims,
@@ -486,6 +547,7 @@ impl<'r> FromRequest<'r> for Headers {
         };
 
         if user.security_stamp != claims.sstamp {
+            debug!("Security stamp mismatch - user: {}, claims: {}", user.security_stamp, claims.sstamp);
             if let Some(stamp_exception) =
                 user.stamp_exception.as_deref().and_then(|s| serde_json::from_str::<UserStampException>(s).ok())
             {
@@ -817,11 +879,7 @@ impl<'r> FromRequest<'r> for OwnerHeaders {
 //
 // Client IP address detection
 //
-use std::{
-    fs::File,
-    io::{Read, Write},
-    net::IpAddr,
-};
+use std::net::IpAddr;
 
 pub struct ClientIp {
     pub ip: IpAddr,
