@@ -43,3 +43,7 @@ terraform.rc
 **/.idea/*
 
 .DS_Store
+
+target_al2/
+target_al2023/
+lib/
